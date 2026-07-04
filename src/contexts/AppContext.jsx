@@ -168,8 +168,6 @@ export function AppProvider({ children }) {
   const syncRef = useRef(null);
   const pushVersionRef = useRef(null);
   const isInitialMount = useRef(true);
-  const [sheetLoading, setSheetLoading] = useState(false);
-  // (sheetLoading exposed for future manual import use)
 
   const lang = settings.lang;
   const isLoggedIn = !!user;
@@ -552,7 +550,7 @@ export function AppProvider({ children }) {
 
   const value = {
     people, setPeople, events, memories, places, tags, settings, activeTab, toast, lang,
-    lifeScore, stats, suggestions, scoreHistory, user, isLoggedIn, isSyncing, sheetLoading,
+    lifeScore, stats, suggestions, scoreHistory, user, isLoggedIn, isSyncing,
     setActiveTab, toggleLang, setSettings, showToast,
     addPerson, updatePerson, deletePerson, addInteraction,
     addEvent, updateEvent, deleteEvent,
