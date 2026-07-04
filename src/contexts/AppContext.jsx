@@ -3,19 +3,17 @@ import {
   onAuthChange, signInWithGoogle as fbSignInGoogle,
   signInWithEmail as fbSignInEmail, signUpWithEmail as fbSignUpEmail,
   signOutUser as fbSignOut,
-  syncToFirestore, loadFromFirestore, syncTagsToFirestore, loadTagsFromFirestore,
-  subscribeToFirestore,
+  loadTagsFromFirestore, subscribeToFirestore,
 } from '../firebase/firebase';
+import { initApiClient, apiPeople, apiEvents, apiMemories, apiPlaces, apiDataHub } from '../api/client';
+import { apiAuth } from '../api/client';
 
 const AppContext = createContext();
 
 const KEYS = {
-  people: 'protsphere_people',
-  events: 'protsphere_events',
-  memories: 'protsphere_memories',
-  places: 'protsphere_places',
-  tags: 'protsphere_tags',
-  settings: 'protsphere_settings',
+  people: 'protsphere_people', events: 'protsphere_events',
+  memories: 'protsphere_memories', places: 'protsphere_places',
+  tags: 'protsphere_tags', settings: 'protsphere_settings',
   scoreHistory: 'protsphere_score_history',
 };
 
@@ -46,25 +44,18 @@ export function getScoreInfo(score) {
 }
 
 function loadJSON(key, def) {
-  try {
-    const raw = localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : def;
-  } catch { return def; }
+  try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : def; }
+  catch { return def; }
 }
-
 function persist(key, data) {
-  try { localStorage.setItem(key, JSON.stringify(data)); } catch (e) { console.error('Persist failed:', key, e.message); }
+  try { localStorage.setItem(key, JSON.stringify(data)); } catch {}
 }
 
-function genId() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-}
+function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
 
 function daysBetween(d1, d2) {
   if (!d1 || !d2) return 0;
-  const a = new Date(d1 + 'T00:00:00');
-  const b = new Date(d2 + 'T00:00:00');
-  return Math.round((b - a) / (1000 * 60 * 60 * 24));
+  return Math.round((new Date(d2) - new Date(d1)) / (1000 * 60 * 60 * 24));
 }
 
 function calcLifeScore(people, events, memories, places) {
@@ -75,7 +66,7 @@ function calcLifeScore(people, events, memories, places) {
   const travelRaw = Math.min(visitedPlaces * 12 + places.filter(p => p.type === 'wantToVisit').length * 5, 100);
   const health = 70;
   const learningRaw = Math.min(memories.length * 3, 100);
-  const positiveMoods = memories.filter(m => ['happy', 'excited', 'peaceful', 'grateful', 'inspired', 'loved'].includes(m.mood)).length;
+  const positiveMoods = memories.filter(m => ['happy','excited','peaceful','grateful','inspired','loved'].includes(m.mood)).length;
   const emotionRaw = memories.length > 0 ? Math.round((positiveMoods / memories.length) * 100) : 50;
   const scores = {
     relationships: relScore, social: Math.round(socialRaw), travel: Math.round(travelRaw),
@@ -165,13 +156,13 @@ export function AppProvider({ children }) {
   const [user, setUser] = useState(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [scoreHistory, setScoreHistory] = useState(() => loadJSON(KEYS.scoreHistory, []));
-  const syncRef = useRef(null);
-  const pushVersionRef = useRef(null);
-  const isInitialMount = useRef(true);
+  const [userRole, setUserRole] = useState(null);
+  const unsubscribeRef = useRef(null);
 
   const lang = settings.lang;
   const isLoggedIn = !!user;
 
+  // Persist to localStorage
   useEffect(() => { persist(KEYS.people, people); }, [people]);
   useEffect(() => { persist(KEYS.events, events); }, [events]);
   useEffect(() => { persist(KEYS.memories, memories); }, [memories]);
@@ -180,116 +171,65 @@ export function AppProvider({ children }) {
   useEffect(() => { persist(KEYS.settings, settings); }, [settings]);
   useEffect(() => { persist(KEYS.scoreHistory, scoreHistory); }, [scoreHistory]);
 
+  // Init API client
+  useEffect(() => {
+    initApiClient();
+  }, []);
+
   // Firebase Auth listener
   useEffect(() => {
-    const unsub = onAuthChange((fbUser) => {
+    const unsub = onAuthChange(async (fbUser) => {
       if (fbUser) {
         setUser({ uid: fbUser.uid, email: fbUser.email, displayName: fbUser.displayName || fbUser.email?.split('@')[0] || 'User' });
         setSettings(prev => ({ ...prev, loggedIn: true, email: fbUser.email || '', userId: fbUser.uid, displayName: fbUser.displayName || prev.displayName }));
+        // Get role from API
+        try {
+          const me = await apiAuth.me();
+          setUserRole(me.role || 'editor');
+        } catch {
+          setUserRole('editor');
+        }
       } else {
         setUser(null);
+        setUserRole(null);
         setSettings(prev => ({ ...prev, loggedIn: false, userId: '' }));
       }
     });
     return unsub;
   }, []);
 
-  // Load from Firestore on login + real-time listener
+  // Firestore real-time listener for reads (only when logged in)
   useEffect(() => {
     if (!user?.uid) return;
-    let unsub;
     let mounted = true;
+    let unsub;
+
     (async () => {
+      // Load tags first
       try {
-        // 1. Load tags from Firestore FIRST
         const fbTags = await loadTagsFromFirestore(user.uid);
         if (fbTags && mounted) setTags(fbTags);
+      } catch {}
 
-        // 2. Load data from Firestore FIRST (before pushing)
-        const fbData = await loadFromFirestore(user.uid);
+      // Subscribe to real-time updates from Firestore
+      unsub = subscribeToFirestore(user.uid, (coll, data) => {
         if (!mounted) return;
-
-        const localPeople = people || [];
-        const localEvents = events || [];
-        const localMemories = memories || [];
-        const localPlaces = places || [];
-
-        const fbPeople = fbData.people || [];
-        const fbEvents = fbData.events || [];
-        const fbMemories = fbData.memories || [];
-        const fbPlaces = fbData.places || [];
-
-        // 3. Merge: if local is empty but Firestore has data → use Firestore data
-        //    If both have data → merge (local additions + Firestore existing that aren't in local)
-        //    If Firestore is empty → push local data up
-        const mergeArrays = (local, remote) => {
-          const merged = [...local];
-          for (const rItem of remote) {
-            const match = merged.find(m => m.id === rItem.id);
-            if (!match) {
-              merged.push(rItem);
-            }
-          }
-          return merged;
-        };
-
-        const mergedPeople = mergeArrays(localPeople, fbPeople);
-        const mergedEvents = mergeArrays(localEvents, fbEvents);
-        const mergedMemories = mergeArrays(localMemories, fbMemories);
-        const mergedPlaces = mergeArrays(localPlaces, fbPlaces);
-
-        // If Firestore had data that local didn't have, update local state
-        if (fbPeople.length > 0 && mergedPeople.length !== localPeople.length) {
-          setPeople(mergedPeople);
+        const strData = JSON.stringify(data);
+        // Don't overwrite if local was just written by API (will be updated by listener)
+        switch (coll) {
+          case 'people': setPeople(data); break;
+          case 'events': setEvents(data); break;
+          case 'memories': setMemories(data); break;
+          case 'places': setPlaces(data); break;
         }
-        if (fbEvents.length > 0 && mergedEvents.length !== localEvents.length) {
-          setEvents(mergedEvents);
-        }
-        if (fbMemories.length > 0 && mergedMemories.length !== localMemories.length) {
-          setMemories(mergedMemories);
-        }
-        if (fbPlaces.length > 0 && mergedPlaces.length !== localPlaces.length) {
-          setPlaces(mergedPlaces);
-        }
+      });
 
-        // 4. Push merged data to Firestore (safe: won't overwrite what's already there)
-        const mergedData = { people: mergedPeople, events: mergedEvents, memories: mergedMemories, places: mergedPlaces };
-        await syncToFirestore(user.uid, mergedData);
-        await syncTagsToFirestore(user.uid, tags);
-
-        // 5. Set push version hashes PER COLLECTION for proper echo detection
-        pushVersionRef.current = {
-          people: JSON.stringify(mergedPeople),
-          events: JSON.stringify(mergedEvents),
-          memories: JSON.stringify(mergedMemories),
-          places: JSON.stringify(mergedPlaces),
-        };
-      } catch (e) {
-        console.warn('Firestore sync failed:', e.message);
-      }
-      if (!mounted) return;
-        // Subscribe AFTER all sync/merge logic completes
-        unsub = subscribeToFirestore(user.uid, (coll, data) => {
-          const str = JSON.stringify(data);
-          // Echo detection: compare per-collection JSON
-          if (pushVersionRef.current?.[coll] === str) return;
-          switch (coll) {
-            case 'people': setPeople(data); break;
-            case 'events': setEvents(data); break;
-            case 'memories': setMemories(data); break;
-            case 'places': setPlaces(data); break;
-          }
-        });
-        showToast(lang === 'vi' ? 'Đã đồng bộ dữ liệu từ Cloud' : 'Data synced from Cloud');
-      })();
-
-      // Re-subscribe on tab visibility change to catch cross-device updates
+      // Refresh on visibility change (cross-device sync)
       const onVisible = () => {
         if (document.visibilityState === 'visible') {
-          if (unsub) { unsub(); unsub = null; }
+          if (unsub) unsub();
           unsub = subscribeToFirestore(user.uid, (coll, data) => {
-            const str = JSON.stringify(data);
-            if (pushVersionRef.current?.[coll] === str) return;
+            if (!mounted) return;
             switch (coll) {
               case 'people': setPeople(data); break;
               case 'events': setEvents(data); break;
@@ -300,38 +240,14 @@ export function AppProvider({ children }) {
         }
       };
       document.addEventListener('visibilitychange', onVisible);
-      return () => { 
-        mounted = false; 
-        if (unsub) unsub(); 
+      unsubscribeRef.current = () => {
+        if (unsub) unsub();
         document.removeEventListener('visibilitychange', onVisible);
       };
-  }, [user?.uid]);
+    })();
 
-  // Sync to Firestore on data change (debounced)
-  useEffect(() => {
-    if (!user?.uid) return;
-    if (syncRef.current) clearTimeout(syncRef.current);
-    syncRef.current = setTimeout(async () => {
-      try {
-        setIsSyncing(true);
-        const data = { people, events, memories, places };
-        await syncToFirestore(user.uid, data);
-        await syncTagsToFirestore(user.uid, tags);
-        // Update per-collection push hashes for echo detection
-        pushVersionRef.current = {
-          people: JSON.stringify(people),
-          events: JSON.stringify(events),
-          memories: JSON.stringify(memories),
-          places: JSON.stringify(places),
-        };
-      } catch (e) {
-        console.warn('Firestore sync failed:', e.message);
-      } finally {
-        setIsSyncing(false);
-      }
-    }, 3000);
-    return () => { if (syncRef.current) clearTimeout(syncRef.current); };
-  }, [people, events, memories, places, tags, user?.uid]);
+    return () => { mounted = false; if (unsubscribeRef.current) unsubscribeRef.current(); };
+  }, [user?.uid]);
 
   const showToast = useCallback((msg) => {
     setToast(msg);
@@ -342,7 +258,6 @@ export function AppProvider({ children }) {
   const lifeScore = calcLifeScore(people, events, memories, places);
   const suggestions = generateSuggestions(people, events, memories, lang, places);
 
-  // Track score history
   useEffect(() => {
     const today = new Date().toISOString().split('T')[0];
     setScoreHistory(prev => {
@@ -362,88 +277,137 @@ export function AppProvider({ children }) {
     peopleByTag: tags.map(t => ({ ...t, count: people.filter(p => (p.tags || []).some(pt => pt.id === t.id)).length })),
   };
 
-  const addPerson = useCallback((person) => {
+  // ─── CRUD: People (all writes go through API) ───
+  const addPerson = useCallback(async (person) => {
     const p = { ...person, id: genId(), createdAt: new Date().toISOString() };
-    setPeople(prev => [...prev, p]);
-    showToast('Đã thêm ' + p.name);
-    return p;
+    setPeople(prev => [...prev, p]); // optimistic local update
+    try {
+      const result = await apiPeople.create(p);
+      showToast('Đã thêm ' + p.name);
+      return result;
+    } catch (e) {
+      setPeople(prev => prev.filter(x => x.id !== p.id)); // rollback
+      showToast('Lỗi: ' + e.message);
+    }
   }, [showToast]);
 
-  const updatePerson = useCallback((id, updates) => {
+  const updatePerson = useCallback(async (id, updates) => {
     setPeople(prev => prev.map(p => p.id === id ? { ...p, ...updates, updatedAt: new Date().toISOString() } : p));
-    showToast('Đã cập nhật');
+    try {
+      await apiPeople.update(id, updates);
+    } catch (e) {
+      showToast('Lỗi: ' + e.message);
+    }
   }, [showToast]);
 
-  const deletePerson = useCallback((id) => {
+  const deletePerson = useCallback(async (id) => {
     const p = people.find(x => x.id === id);
     setPeople(prev => prev.filter(x => x.id !== id));
-    if (p) showToast('Đã xoá ' + p.name);
     setEvents(prev => prev.map(e => ({ ...e, peopleIds: (e.peopleIds || []).filter(pid => pid !== id) })));
     setMemories(prev => prev.map(m => ({ ...m, peopleIds: (m.peopleIds || []).filter(pid => pid !== id) })));
+    try {
+      await apiPeople.delete(id);
+      if (p) showToast('Đã xoá ' + p.name);
+    } catch (e) {
+      showToast('Lỗi: ' + e.message);
+    }
   }, [showToast, people]);
 
-  const addInteraction = useCallback((personId, interaction) => {
+  const addInteraction = useCallback(async (personId, interaction) => {
+    const newInteraction = { id: genId(), date: new Date().toISOString().split('T')[0], ...interaction };
     setPeople(prev => prev.map(p => {
       if (p.id !== personId) return p;
       const interactions = p.interactions || [];
-      const newInteraction = { id: genId(), date: new Date().toISOString().split('T')[0], ...interaction };
       return { ...p, interactions: [...interactions, newInteraction], lastInteractionDate: new Date().toISOString().split('T')[0], updatedAt: new Date().toISOString() };
     }));
-    showToast('Đã ghi nhận tương tác');
-  }, [showToast]);
+    try {
+      await apiPeople.update(personId, {
+        interactions: [...((people.find(p => p.id === personId)?.interactions) || []), newInteraction],
+        lastInteractionDate: new Date().toISOString().split('T')[0],
+      });
+      showToast('Đã ghi nhận tương tác');
+    } catch (e) {
+      showToast('Lỗi: ' + e.message);
+    }
+  }, [showToast, people]);
 
-  const addEvent = useCallback((event) => {
+  // ─── CRUD: Events ───
+  const addEvent = useCallback(async (event) => {
     const e = { ...event, id: genId(), createdAt: new Date().toISOString() };
     setEvents(prev => [...prev, e]);
-    showToast('Đã thêm sự kiện');
-    return e;
+    try {
+      const result = await apiEvents.create(e);
+      showToast('Đã thêm sự kiện');
+      return result;
+    } catch (e2) {
+      setEvents(prev => prev.filter(x => x.id !== e.id));
+      showToast('Lỗi: ' + e2.message);
+    }
   }, [showToast]);
 
-  const updateEvent = useCallback((id, updates) => {
+  const updateEvent = useCallback(async (id, updates) => {
     setEvents(prev => prev.map(e => e.id === id ? { ...e, ...updates, updatedAt: new Date().toISOString() } : e));
-    showToast('Đã cập nhật');
+    try { await apiEvents.update(id, updates); } catch (e) { showToast('Lỗi: ' + e.message); }
   }, [showToast]);
 
-  const deleteEvent = useCallback((id) => {
+  const deleteEvent = useCallback(async (id) => {
     setEvents(prev => prev.filter(e => e.id !== id));
-    showToast('Đã xoá sự kiện');
+    try { await apiEvents.delete(id); showToast('Đã xoá sự kiện'); } catch (e) { showToast('Lỗi: ' + e.message); }
   }, [showToast]);
 
-  const addMemory = useCallback((memory) => {
+  // ─── CRUD: Memories ───
+  const addMemory = useCallback(async (memory) => {
     const m = { ...memory, id: genId(), createdAt: new Date().toISOString() };
     setMemories(prev => [...prev, m]);
-    showToast('Đã thêm ký ức');
-    return m;
+    try {
+      const result = await apiMemories.create(m);
+      showToast('Đã thêm ký ức');
+      return result;
+    } catch (e2) {
+      setMemories(prev => prev.filter(x => x.id !== m.id));
+      showToast('Lỗi: ' + e2.message);
+    }
   }, [showToast]);
 
-  const updateMemory = useCallback((id, updates) => {
+  const updateMemory = useCallback(async (id, updates) => {
     setMemories(prev => prev.map(m => m.id === id ? { ...m, ...updates, updatedAt: new Date().toISOString() } : m));
-    showToast('Đã cập nhật');
+    try { await apiMemories.update(id, updates); } catch (e) { showToast('Lỗi: ' + e.message); }
   }, [showToast]);
 
-  const deleteMemory = useCallback((id) => {
+  const deleteMemory = useCallback(async (id) => {
     setMemories(prev => prev.filter(m => m.id !== id));
-    showToast('Đã xoá ký ức');
+    try { await apiMemories.delete(id); showToast('Đã xoá ký ức'); } catch (e) { showToast('Lỗi: ' + e.message); }
   }, [showToast]);
 
-  const addPlace = useCallback((place) => {
+  // ─── CRUD: Places ───
+  const addPlace = useCallback(async (place) => {
     const p = { ...place, id: genId(), createdAt: new Date().toISOString() };
     setPlaces(prev => [...prev, p]);
-    showToast('Đã thêm ' + place.name);
-    return p;
+    try {
+      const result = await apiPlaces.create(p);
+      showToast('Đã thêm ' + place.name);
+      return result;
+    } catch (e2) {
+      setPlaces(prev => prev.filter(x => x.id !== p.id));
+      showToast('Lỗi: ' + e2.message);
+    }
   }, [showToast]);
 
-  const updatePlace = useCallback((id, updates) => {
+  const updatePlace = useCallback(async (id, updates) => {
     setPlaces(prev => prev.map(p => p.id === id ? { ...p, ...updates, updatedAt: new Date().toISOString() } : p));
-    showToast('Đã cập nhật');
+    try { await apiPlaces.update(id, updates); } catch (e) { showToast('Lỗi: ' + e.message); }
   }, [showToast]);
 
-  const deletePlace = useCallback((id) => {
+  const deletePlace = useCallback(async (id) => {
     const p = places.find(x => x.id === id);
     setPlaces(prev => prev.filter(x => x.id !== id));
-    if (p) showToast('Đã xoá ' + p.name);
+    try {
+      await apiPlaces.delete(id);
+      if (p) showToast('Đã xoá ' + p.name);
+    } catch (e) { showToast('Lỗi: ' + e.message); }
   }, [showToast, places]);
 
+  // ─── Tags ───
   const addTag = useCallback((tag) => {
     const t = { id: genId(), ...tag };
     setTags(prev => [...prev, t]);
@@ -467,27 +431,32 @@ export function AppProvider({ children }) {
     setSettings(prev => ({ ...prev, lang: prev.lang === 'vi' ? 'en' : 'vi' }));
   }, []);
 
-  const exportData = useCallback(() => {
-    const data = { people, events, memories, places, tags, exportedAt: new Date().toISOString() };
-    const blob = new Blob(['\ufeff' + JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = 'protsphere_export_' + new Date().toISOString().split('T')[0] + '.json'; a.click();
-    URL.revokeObjectURL(url);
-    showToast('Đã xuất dữ liệu');
-  }, [people, events, memories, places, tags, showToast]);
+  const exportData = useCallback(async () => {
+    try {
+      const data = await apiDataHub.exportJson();
+      const blob = new Blob(['\ufeff' + JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'protsphere_export_' + new Date().toISOString().split('T')[0] + '.json'; a.click();
+      URL.revokeObjectURL(url);
+      showToast('Đã xuất dữ liệu');
+    } catch (e) { showToast('Lỗi xuất: ' + e.message); }
+  }, [showToast]);
 
   const importData = useCallback(() => {
     const input = document.createElement('input');
     input.type = 'file'; input.accept = '.json';
-    input.onchange = (e) => {
+    input.onchange = async (e) => {
       const file = e.target.files[0];
       if (!file) return;
       const reader = new FileReader();
-      reader.onload = (ev) => {
+      reader.onload = async (ev) => {
         try {
           const data = JSON.parse(ev.target.result);
-          if (data.people) setPeople(data.people);
+          if (data.people) {
+            await apiDataHub.importJson(data.people);
+            setPeople(data.people);
+          }
           if (data.events) setEvents(data.events);
           if (data.memories) setMemories(data.memories);
           if (data.places) setPlaces(data.places);
@@ -507,11 +476,10 @@ export function AppProvider({ children }) {
     showToast(lang === 'vi' ? 'Đã xoá tất cả dữ liệu' : 'All data cleared');
   }, [lang, showToast]);
 
-  // Auth actions
+  // Auth
   const signInWithGoogle = useCallback(async () => {
     try {
       await fbSignInGoogle();
-      showToast('Đã đăng nhập');
     } catch (e) {
       showToast(lang === 'vi' ? 'Đăng nhập thất bại' : 'Login failed');
       throw e;
@@ -521,7 +489,6 @@ export function AppProvider({ children }) {
   const signInWithEmail = useCallback(async (email, password) => {
     try {
       await fbSignInEmail(email, password);
-      showToast('Đã đăng nhập');
     } catch (e) {
       showToast((lang === 'vi' ? 'Đăng nhập thất bại: ' : 'Login failed: ') + e.message);
       throw e;
@@ -531,7 +498,6 @@ export function AppProvider({ children }) {
   const signUpWithEmail = useCallback(async (email, password) => {
     try {
       await fbSignUpEmail(email, password);
-      showToast('Đã đăng ký');
     } catch (e) {
       showToast((lang === 'vi' ? 'Đăng ký thất bại: ' : 'Signup failed: ') + e.message);
       throw e;
@@ -543,14 +509,12 @@ export function AppProvider({ children }) {
       await fbSignOut();
       setUser(null);
       showToast('Đã đăng xuất');
-    } catch (e) {
-      showToast('Sign out failed');
-    }
+    } catch { showToast('Sign out failed'); }
   }, [showToast]);
 
   const value = {
     people, setPeople, events, memories, places, tags, settings, activeTab, toast, lang,
-    lifeScore, stats, suggestions, scoreHistory, user, isLoggedIn, isSyncing,
+    lifeScore, stats, suggestions, scoreHistory, user, isLoggedIn, isSyncing, userRole,
     setActiveTab, toggleLang, setSettings, showToast,
     addPerson, updatePerson, deletePerson, addInteraction,
     addEvent, updateEvent, deleteEvent,
@@ -559,6 +523,7 @@ export function AppProvider({ children }) {
     addTag, updateTag, deleteTag,
     exportData, importData, clearAllData,
     signInWithGoogle, signInWithEmail, signUpWithEmail, signOut,
+    apiDataHub, apiAuth,
   };
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

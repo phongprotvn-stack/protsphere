@@ -1,10 +1,10 @@
 import { useState } from 'react';
 import { useApp } from '../contexts/AppContext';
-import { Globe, Download, Upload, Trash2, Info, ChevronRight, Cloud, CloudOff } from 'lucide-react';
+import { Globe, Download, Upload, Trash2, Info, ChevronRight, Cloud, CloudOff, RefreshCw, Database, Shield, UserCheck } from 'lucide-react';
 import { t } from '../i18n';
 
 export default function Settings() {
-  const { settings, lang, toggleLang, exportData, importData, clearAllData, user, isLoggedIn, isSyncing, signInWithGoogle, signInWithEmail, signUpWithEmail, signOut, showToast } = useApp();
+  const { settings, lang, toggleLang, exportData, importData, clearAllData, user, isLoggedIn, isSyncing, userRole, signInWithGoogle, signInWithEmail, signUpWithEmail, signOut, showToast } = useApp();
   const [authMode, setAuthMode] = useState('google');
   const [authEmail, setAuthEmail] = useState('');
   const [authPass, setAuthPass] = useState('');
@@ -141,6 +141,58 @@ export default function Settings() {
           <><CloudOff size={18} color="#9CA3AF" /> <span style={{ fontSize: 13, color: '#9CA3AF' }}>{t('settings.notSynced', lang)}</span></>
         )}
         {isSyncing && <RefreshCw size={14} color="#3B82F6" style={{ animation: 'spin 1s linear infinite' }} />}
+      </div>
+
+      {/* RBAC Role Info */}
+      <div className="card" style={{ marginBottom: 20, padding: 14 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+          <Shield size={16} color="#8B5CF6" />
+          <span style={{ fontSize: 13, fontWeight: 700 }}>RBAC Role</span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ fontSize: 13, color: '#6B7280' }}>
+            {userRole ? (
+              <><UserCheck size={14} color="#10B981" style={{ verticalAlign: 'middle', marginRight: 4 }} />
+              <span style={{ textTransform: 'capitalize', fontWeight: 600, color: '#10B981' }}>{userRole}</span></>
+            ) : (
+              <span style={{ color: '#9CA3AF' }}>Guest (Public) — read only</span>
+            )}
+          </div>
+          {userRole === 'admin' && (
+            <span style={{ fontSize: 11, color: '#E6002D', fontWeight: 700 }}>⭐ Owner</span>
+          )}
+        </div>
+      </div>
+
+      {/* Data Hub Connectors */}
+      <div style={{ marginBottom: 20 }}>
+        <div className="title" style={{ marginBottom: 12 }}>📦 Data Hub</div>
+        <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+          {[
+            { icon: Database, color: '#10B981', label: 'Google Sheets', desc: 'Import từ Sheet', onClick: () => {
+              const url = prompt('Nhập Google Sheet CSV URL:');
+              if (url) showToast('🔄 Đang import...');
+            }},
+            { icon: Database, color: '#3B82F6', label: 'JSON Upload', desc: 'Import/Export JSON', onClick: importData },
+            { icon: Database, color: '#8B5CF6', label: 'API Export', desc: 'Tải JSON từ server', onClick: exportData },
+          ].map((item, i) => {
+            const Icon = item.icon;
+            return (
+              <div key={i} className="action-field" style={{ padding: '16px var(--space-card-inner)', borderBottom: i < 2 ? '1px solid #F3F4F6' : 'none' }}>
+                <div className="af-label">
+                  <div style={{ width: 32, height: 32, borderRadius: 10, background: `${item.color}15`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    <Icon size={16} color={item.color} />
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 14, fontWeight: 600 }}>{item.label}</div>
+                    <div style={{ fontSize: 11, color: '#9CA3AF' }}>{item.desc}</div>
+                  </div>
+                </div>
+                <ChevronRight size={18} color="#D1D5DB" />
+              </div>
+            );
+          })}
+        </div>
       </div>
 
       {/* Data Management */}
