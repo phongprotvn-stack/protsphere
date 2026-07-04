@@ -3,13 +3,12 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "functions": {
-    "api/serverless.js": {
-      "memory": 256,
+    "api/index.js": {
       "maxDuration": 30
     }
   },
   "routes": [
-    { "src": "/api/(.*)", "dest": "api/serverless.js" },
+    { "src": "/api/(.*)", "dest": "api/index.js" },
     { "handle": "filesystem" },
     { "src": "/(.*)", "dest": "/index.html" }
   ]
